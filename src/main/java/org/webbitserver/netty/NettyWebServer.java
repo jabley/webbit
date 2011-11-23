@@ -100,8 +100,9 @@ public class NettyWebServer implements WebServer {
                 pipeline.addLast("decompressor", new HttpContentDecompressor());
                 pipeline.addLast("encoder", new HttpResponseEncoder());
                 pipeline.addLast("compressor", new HttpContentCompressor());
-                pipeline.addLast("handler", new NettyHttpChannelHandler(
-                        executor, handlers, id, timestamp, exceptionHandler, ioExceptionHandler));
+                pipeline.addLast("byteRanges", new RangeChunker());
+                pipeline.addLast("handler", new NettyHttpChannelHandler(executor, handlers, id, timestamp,
+                        exceptionHandler, ioExceptionHandler));
                 return pipeline;
             }
         });

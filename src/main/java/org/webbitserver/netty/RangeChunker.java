@@ -1,0 +1,238 @@
+package org.webbitserver.netty;
+
+import java.util.Arrays;
+import java.util.Queue;
+
+import org.jboss.netty.buffer.ChannelBuffer;
+import org.jboss.netty.buffer.ChannelBuffers;
+import org.jboss.netty.channel.Channel;
+import org.jboss.netty.channel.ChannelHandlerContext;
+import org.jboss.netty.channel.Channels;
+import org.jboss.netty.channel.LifeCycleAwareChannelHandler;
+import org.jboss.netty.channel.MessageEvent;
+import org.jboss.netty.channel.SimpleChannelHandler;
+import org.jboss.netty.handler.codec.embedder.EncoderEmbedder;
+import org.jboss.netty.handler.codec.http.DefaultHttpChunk;
+import org.jboss.netty.handler.codec.http.HttpChunk;
+import org.jboss.netty.handler.codec.http.HttpHeaders;
+import org.jboss.netty.handler.codec.http.HttpMessage;
+import org.jboss.netty.handler.codec.http.HttpResponse;
+import org.jboss.netty.handler.codec.oneone.OneToOneEncoder;
+import org.jboss.netty.util.internal.LinkedTransferQueue;
+
+/**
+ * <p>
+ * SimpleChannelHandler intended to provide support for byte Range requests.
+ * </p>
+ * 
+ * Heavily influenced by HttpContentCompressor / HttpContentEncoder.
+ */
+public class RangeChunker extends SimpleChannelHandler {
+
+    /**
+     * It could be argued that we should parse the header value when processing
+     * the response, when we might have a better idea of the entity size. Maybe?
+     */
+    private final Queue<ByteRangeSet> rangeQueue = new LinkedTransferQueue<ByteRangeSet>();
+
+    private volatile EncoderEmbedder<ChannelBuffer> encoder;
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void messageReceived(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
+        Object msg = e.getMessage();
+
+        if (!(msg instanceof HttpMessage)) {
+            ctx.sendUpstream(e);
+            return;
+        }
+
+        HttpMessage m = (HttpMessage) msg;
+        String range = m.getHeader(HttpHeaders.Names.RANGE);
+
+        ByteRangeSet brs;
+
+        if (range == null) {
+            brs = ByteRangeSet.NO_RANGE_HEADER;
+        } else if (range.startsWith("bytes=")) {
+            brs = ByteRangeSet.parse(range.substring(6));
+        } else {
+            throw new SyntacticallyInvalidByteRangeException(range);
+        }
+
+        boolean offered = rangeQueue.offer(brs);
+        assert offered;
+
+        ctx.sendUpstream(e);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void writeRequested(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
+        Object msg = e.getMessage();
+
+        if (msg instanceof HttpResponse && ((HttpResponse) msg).getStatus().getCode() == 100) {
+            // 100-continue response must be passed through.
+            ctx.sendDownstream(e);
+        } else if (msg instanceof HttpMessage) {
+            HttpMessage m = (HttpMessage) msg;
+
+            String contentRange = m.getHeader(HttpHeaders.Names.CONTENT_RANGE);
+
+            if (contentRange != null) {
+                // Something has already set the Content-Range header, so don't
+                // do any processing in here.
+                ctx.sendDownstream(e);
+            } else {
+
+                ByteRangeSet brs = rangeQueue.poll();
+
+                if (brs == null) {
+                    throw new IllegalStateException("cannot send more responses than requests");
+                }
+
+                if (brs == ByteRangeSet.NO_RANGE_HEADER) {
+                    ctx.sendDownstream(e);
+                } else {
+                    boolean hasContent = m.isChunked() || m.getContent().readable();
+
+                    if (hasContent && (encoder = newContentRangeEncoder(brs)) != null) {
+                        // Encode the content and remove or replace the existing
+                        // headers so that the message looks like a decoded
+                        // message.
+                        m.setHeader(HttpHeaders.Names.CONTENT_RANGE, brs.get(0).asContentRange());
+
+                        if (!m.isChunked()) {
+                            ChannelBuffer content = m.getContent();
+
+                            // Encode the content.
+                            content = ChannelBuffers.wrappedBuffer(encode(content), finishEncode());
+
+                            // Replace the content.
+                            m.setContent(content);
+                            m.setHeader(HttpHeaders.Names.CONTENT_RANGE,
+                                    brs.get(0).asContentRange(content.readableBytes()));
+                            if (m.containsHeader(HttpHeaders.Names.CONTENT_LENGTH)) {
+                                m.setHeader(HttpHeaders.Names.CONTENT_LENGTH, Integer.toString(content.readableBytes()));
+                            }
+                        }
+                    }
+
+                    // Because HttpMessage is a mutable object, we can simply
+                    // forward the write request.
+                    ctx.sendDownstream(e);
+                }
+            }
+        } else if (msg instanceof HttpChunk) {
+            HttpChunk c = (HttpChunk) msg;
+            ChannelBuffer content = c.getContent();
+
+            // Encode the chunk if necessary.
+            if (encoder != null) {
+                if (!c.isLast()) {
+                    content = encode(content);
+                    if (content.readable()) {
+                        c.setContent(content);
+                        ctx.sendDownstream(e);
+                    }
+                } else {
+                    ChannelBuffer lastProduct = finishEncode();
+
+                    // Generate an additional chunk if the decoder produced
+                    // the last product on closure,
+                    if (lastProduct.readable()) {
+                        Channels.write(ctx, Channels.succeededFuture(e.getChannel()),
+                                new DefaultHttpChunk(lastProduct), e.getRemoteAddress());
+                    }
+
+                    // Emit the last chunk.
+                    ctx.sendDownstream(e);
+                }
+            } else {
+                ctx.sendDownstream(e);
+            }
+        } else {
+            ctx.sendDownstream(e);
+        }
+    }
+
+    private ChannelBuffer encode(ChannelBuffer buf) {
+        encoder.offer(buf);
+        return ChannelBuffers.wrappedBuffer(encoder.pollAll(new ChannelBuffer[encoder.size()]));
+    }
+
+    private ChannelBuffer finishEncode() {
+        ChannelBuffer result;
+
+        if (encoder.finish()) {
+            result = ChannelBuffers.wrappedBuffer(encoder.pollAll(new ChannelBuffer[encoder.size()]));
+        } else {
+            result = ChannelBuffers.EMPTY_BUFFER;
+        }
+
+        encoder = null;
+
+        return result;
+    }
+
+    private EncoderEmbedder<ChannelBuffer> newContentRangeEncoder(ByteRangeSet brs) {
+        return new EncoderEmbedder<ChannelBuffer>(new RangeEncoder(brs));
+    }
+
+    static class RangeEncoder extends OneToOneEncoder implements LifeCycleAwareChannelHandler {
+
+        private ChannelHandlerContext ctx;
+
+        private final ByteRangeSet brs;
+
+        private RangeEncoder(ByteRangeSet brs) {
+            this.brs = brs;
+        }
+
+        @Override
+        public void beforeAdd(ChannelHandlerContext ctx) throws Exception {
+            this.ctx = ctx;
+        }
+
+        @Override
+        public void afterAdd(ChannelHandlerContext ctx) throws Exception {
+            // no-op
+        }
+
+        @Override
+        public void beforeRemove(ChannelHandlerContext ctx) throws Exception {
+            // no-op
+        }
+
+        @Override
+        public void afterRemove(ChannelHandlerContext ctx) throws Exception {
+            // no-op
+        }
+
+        @Override
+        protected Object encode(ChannelHandlerContext ctx, Channel channel, Object msg) throws Exception {
+            if (!(msg instanceof ChannelBuffer)) {
+                return msg;
+            }
+
+            ChannelBuffer result = (ChannelBuffer) msg;
+
+            ChannelBuffer raw = (ChannelBuffer) msg;
+            byte[] in = new byte[raw.readableBytes()];
+            raw.readBytes(in);
+
+            RangeSpec spec = brs.get(0);
+
+            byte[] out = Arrays.copyOfRange(in, spec.start, spec.length);
+
+            result = ctx.getChannel().getConfig().getBufferFactory().getBuffer(raw.order(), out, 0, spec.length);
+
+            return result;
+        }
+
+    }
+}
