@@ -38,6 +38,7 @@ public class RangeTest {
         }).start();
         HttpURLConnection urlConnection = (HttpURLConnection) specifyRange(httpGet(webServer, "/"), "0-9");
         String result = contents(urlConnection);
+        assertEquals(206, urlConnection.getResponseCode());
         assertEquals("0-9/99", urlConnection.getHeaderField("content-range"));
         assertEquals(10, urlConnection.getContentLength());
         assertEquals(content.substring(0, 10), result);

@@ -7,16 +7,15 @@ import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelHandlerContext;
-import org.jboss.netty.channel.Channels;
 import org.jboss.netty.channel.LifeCycleAwareChannelHandler;
 import org.jboss.netty.channel.MessageEvent;
 import org.jboss.netty.channel.SimpleChannelHandler;
 import org.jboss.netty.handler.codec.embedder.EncoderEmbedder;
-import org.jboss.netty.handler.codec.http.DefaultHttpChunk;
 import org.jboss.netty.handler.codec.http.HttpChunk;
 import org.jboss.netty.handler.codec.http.HttpHeaders;
 import org.jboss.netty.handler.codec.http.HttpMessage;
 import org.jboss.netty.handler.codec.http.HttpResponse;
+import org.jboss.netty.handler.codec.http.HttpResponseStatus;
 import org.jboss.netty.handler.codec.oneone.OneToOneEncoder;
 import org.jboss.netty.util.internal.LinkedTransferQueue;
 
@@ -80,8 +79,8 @@ public class RangeChunker extends SimpleChannelHandler {
     public void writeRequested(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
         Object msg = e.getMessage();
 
-        if (msg instanceof HttpResponse && ((HttpResponse) msg).getStatus().getCode() == 100) {
-            // 100-continue response must be passed through.
+        if (msg instanceof HttpResponse && ((HttpResponse) msg).getStatus().getCode() != 200) {
+            // Non-200 responses should not have Range processing applied
             ctx.sendDownstream(e);
         } else if (msg instanceof HttpMessage) {
             HttpMessage m = (HttpMessage) msg;
@@ -117,6 +116,10 @@ public class RangeChunker extends SimpleChannelHandler {
                         // headers so that the message looks like a decoded
                         // message.
                         m.setHeader(HttpHeaders.Names.CONTENT_RANGE, brs.get(0).asContentRange());
+
+                        if (m instanceof HttpResponse) {
+                            ((HttpResponse) m).setStatus(HttpResponseStatus.PARTIAL_CONTENT);
+                        }
 
                         if (!m.isChunked()) {
                             ChannelBuffer content = m.getContent();
