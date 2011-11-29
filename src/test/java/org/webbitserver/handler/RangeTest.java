@@ -36,11 +36,11 @@ public class RangeTest {
                 response.content(content).end();
             }
         }).start();
-        HttpURLConnection urlConnection = (HttpURLConnection) specifyRange(httpGet(webServer, "/"), "0-10");
+        HttpURLConnection urlConnection = (HttpURLConnection) specifyRange(httpGet(webServer, "/"), "0-9");
         String result = contents(urlConnection);
-        assertEquals("0-10/11", urlConnection.getHeaderField("content-range"));
-        assertEquals(11, urlConnection.getContentLength());
-        assertEquals(content.substring(0, 11), result);
+        assertEquals("0-9/99", urlConnection.getHeaderField("content-range"));
+        assertEquals(10, urlConnection.getContentLength());
+        assertEquals(content.substring(0, 10), result);
     }
 
     @Test

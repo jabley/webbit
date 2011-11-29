@@ -33,7 +33,9 @@ public class RangeChunker extends SimpleChannelHandler {
      * It could be argued that we should parse the header value when processing
      * the response, when we might have a better idea of the entity size. Maybe?
      */
-    private final Queue<ByteRangeSet> rangeQueue = new LinkedTransferQueue<ByteRangeSet>();
+    private final Queue<Object> rangeQueue = new LinkedTransferQueue<Object>();
+
+    private static final Object NO_RANGE_HEADER = new Object();
 
     private volatile EncoderEmbedder<ChannelBuffer> encoder;
 
@@ -52,17 +54,20 @@ public class RangeChunker extends SimpleChannelHandler {
         HttpMessage m = (HttpMessage) msg;
         String range = m.getHeader(HttpHeaders.Names.RANGE);
 
-        ByteRangeSet brs;
+        Object rangeMarker;
 
         if (range == null) {
-            brs = ByteRangeSet.NO_RANGE_HEADER;
+            rangeMarker = NO_RANGE_HEADER;
         } else if (range.startsWith("bytes=")) {
-            brs = ByteRangeSet.parse(range.substring(6));
+            rangeMarker = range;
         } else {
+
+            // TODO: really want to return a response indicating bad range
+            // request?
             throw new SyntacticallyInvalidByteRangeException(range);
         }
 
-        boolean offered = rangeQueue.offer(brs);
+        boolean offered = rangeQueue.offer(rangeMarker);
         assert offered;
 
         ctx.sendUpstream(e);
@@ -89,16 +94,23 @@ public class RangeChunker extends SimpleChannelHandler {
                 ctx.sendDownstream(e);
             } else {
 
-                ByteRangeSet brs = rangeQueue.poll();
+                Object rangeMarker = rangeQueue.poll();
 
-                if (brs == null) {
+                if (rangeMarker == null) {
                     throw new IllegalStateException("cannot send more responses than requests");
                 }
 
-                if (brs == ByteRangeSet.NO_RANGE_HEADER) {
+                if (rangeMarker == NO_RANGE_HEADER) {
                     ctx.sendDownstream(e);
                 } else {
+
+                    // TODO: Support If-Range conditional check
+
                     boolean hasContent = m.isChunked() || m.getContent().readable();
+
+                    String range = (String) rangeMarker;
+
+                    ByteRangeSet brs = ByteRangeSet.parse(range.substring(6), m.getContent().readableBytes());
 
                     if (hasContent && (encoder = newContentRangeEncoder(brs)) != null) {
                         // Encode the content and remove or replace the existing
@@ -109,15 +121,25 @@ public class RangeChunker extends SimpleChannelHandler {
                         if (!m.isChunked()) {
                             ChannelBuffer content = m.getContent();
 
-                            // Encode the content.
-                            content = ChannelBuffers.wrappedBuffer(encode(content), finishEncode());
+                            if (brs.size() == 1) {
 
-                            // Replace the content.
-                            m.setContent(content);
-                            m.setHeader(HttpHeaders.Names.CONTENT_RANGE,
-                                    brs.get(0).asContentRange(content.readableBytes()));
-                            if (m.containsHeader(HttpHeaders.Names.CONTENT_LENGTH)) {
-                                m.setHeader(HttpHeaders.Names.CONTENT_LENGTH, Integer.toString(content.readableBytes()));
+                                // Encode the content.
+                                content = ChannelBuffers.wrappedBuffer(encode(content), finishEncode());
+
+                                // Replace the content.
+                                m.setContent(content);
+                                m.setHeader(HttpHeaders.Names.CONTENT_RANGE, brs.get(0).asContentRange());
+                                if (m.containsHeader(HttpHeaders.Names.CONTENT_LENGTH)) {
+                                    m.setHeader(HttpHeaders.Names.CONTENT_LENGTH,
+                                            Integer.toString(content.readableBytes()));
+                                }
+                            } else {
+                                assert brs.size() > 1;
+
+                                throw new UnsupportedOperationException("Not implemented");
+
+                                // TODO: Need to send a multipart/byteranges
+                                // response.
                             }
                         }
                     }
@@ -128,33 +150,35 @@ public class RangeChunker extends SimpleChannelHandler {
                 }
             }
         } else if (msg instanceof HttpChunk) {
-            HttpChunk c = (HttpChunk) msg;
-            ChannelBuffer content = c.getContent();
+            ctx.sendDownstream(e);
 
-            // Encode the chunk if necessary.
-            if (encoder != null) {
-                if (!c.isLast()) {
-                    content = encode(content);
-                    if (content.readable()) {
-                        c.setContent(content);
-                        ctx.sendDownstream(e);
-                    }
-                } else {
-                    ChannelBuffer lastProduct = finishEncode();
-
-                    // Generate an additional chunk if the decoder produced
-                    // the last product on closure,
-                    if (lastProduct.readable()) {
-                        Channels.write(ctx, Channels.succeededFuture(e.getChannel()),
-                                new DefaultHttpChunk(lastProduct), e.getRemoteAddress());
-                    }
-
-                    // Emit the last chunk.
-                    ctx.sendDownstream(e);
-                }
-            } else {
-                ctx.sendDownstream(e);
-            }
+            // HttpChunk c = (HttpChunk) msg;
+            // ChannelBuffer content = c.getContent();
+            //
+            // // Encode the chunk if necessary.
+            // if (encoder != null) {
+            // if (!c.isLast()) {
+            // content = encode(content);
+            // if (content.readable()) {
+            // c.setContent(content);
+            // ctx.sendDownstream(e);
+            // }
+            // } else {
+            // ChannelBuffer lastProduct = finishEncode();
+            //
+            // // Generate an additional chunk if the decoder produced
+            // // the last product on closure,
+            // if (lastProduct.readable()) {
+            // Channels.write(ctx, Channels.succeededFuture(e.getChannel()),
+            // new DefaultHttpChunk(lastProduct), e.getRemoteAddress());
+            // }
+            //
+            // // Emit the last chunk.
+            // ctx.sendDownstream(e);
+            // }
+            // } else {
+            // ctx.sendDownstream(e);
+            // }
         } else {
             ctx.sendDownstream(e);
         }
