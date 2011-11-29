@@ -2,24 +2,6 @@ package org.webbitserver.netty;
 
 class RangeSpec {
 
-    enum Type {
-
-        /**
-         * bytes=-2
-         */
-        SUFFIX_RANGE,
-
-        /**
-         * bytes=2-
-         */
-        PREFIX_RANGE,
-
-        /**
-         * bytes=2-199
-         */
-        BOUNDED_RANGE;
-    }
-
     /**
      * Start byte offset, inclusive.
      */
@@ -40,8 +22,6 @@ class RangeSpec {
      */
     public final int contentLength;
 
-    public final Type type;
-
     public RangeSpec(String byteRangeSpec, int contentLength) {
         int pos = byteRangeSpec.indexOf('-');
 
@@ -49,9 +29,7 @@ class RangeSpec {
             switch (pos) {
             case -1:
                 throw new SyntacticallyInvalidByteRangeException("Invalid range-spec: " + byteRangeSpec);
-            case 0:
-                this.type = Type.SUFFIX_RANGE;
-
+            case 0: // "-5"
                 int number = Integer.parseInt(byteRangeSpec.substring(1));
                 if (number < 1) {
                     throw new SyntacticallyInvalidByteRangeException("Invalid range-spec: " + byteRangeSpec);
@@ -71,11 +49,9 @@ class RangeSpec {
             default:
                 this.start = Integer.parseInt(byteRangeSpec.substring(0, pos++));
 
-                if (byteRangeSpec.length() == pos) {
-                    this.type = Type.PREFIX_RANGE;
+                if (byteRangeSpec.length() == pos) { // "5-"
                     this.end = contentLength - 1;
-                } else {
-                    this.type = Type.BOUNDED_RANGE;
+                } else { // "5-9"
 
                     /*
                      * c.f. http://tools.ietf.org/html/rfc2616#section-14.35
@@ -118,7 +94,6 @@ class RangeSpec {
         this.end = end;
         this.length = getRangeLength();
         this.contentLength = contentLength;
-        this.type = (end == contentLength - 1) ? Type.PREFIX_RANGE : Type.BOUNDED_RANGE;
     }
 
     /**
